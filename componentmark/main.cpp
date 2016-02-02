@@ -38,6 +38,21 @@
 #include <QtQml/qqmlengine.h>
 #include <QtGui/qguiapplication.h>
 
+#include <inttypes.h>
+
+#ifdef PROFILER_ENABLERS
+#include <gperftools/profiler.h>
+#endif
+
+//#define CALLGRIND_ENABLERS
+
+#ifdef CALLGRIND_ENABLERS
+#include <valgrind/callgrind.h>
+#else
+#define CALLGRIND_START_INSTRUMENTATION
+#define CALLGRIND_STOP_INSTRUMENTATION
+#endif
+
 template <typename T, int N> static int lengthOf(const T(&)[N]) { return N; }
 
 template <int N> static const char *argumentValue(const char *argument, const char (&key)[N])
@@ -55,14 +70,28 @@ int main(int argc, char *argv[])
     int typeCount = lengthOf(defaultTypes);
 
     int iterations = 100;
+    const char *csvId = 0;
+
+    const char *profile = 0;
+    const char *callgrind = 0;
 
     QByteArray importStatements;
+    QByteArray importDescription;
 
     for (int i = 1; i < argc; ++i) {
         if (const char *value = argumentValue(argv[i], "--iterations=")) {
             iterations = QByteArray(value).toInt();
         } else if (const char *value = argumentValue(argv[i], "--import=")) {
             importStatements += "import " + QByteArray(value) + "\n";
+            if (!importDescription.isEmpty())
+                importDescription += "; ";
+            importDescription += value;
+        } else if (const char *value = argumentValue(argv[i], "--profile=")) {
+            profile = value;
+        } else if (const char *value = argumentValue(argv[i], "--csv=")) {
+            csvId = value;
+        } else if (const char *value = argumentValue(argv[i], "--callgrind=")) {
+            callgrind = value;
         } else if (i < argc) {
             types = argv + i;
             typeCount = argc - i;
@@ -71,6 +100,13 @@ int main(int argc, char *argv[])
             break;
         }
     }
+
+    const bool callgrindCompilation = callgrind && qstrcmp(callgrind, "compilation") == 0;
+    const bool callgrindInstantiation = callgrind && qstrcmp(callgrind, "instantiation") == 0;
+    const bool callgrindSingleInstantiation = callgrind && qstrcmp(callgrind, "single-instantiation") == 0;
+    const bool callgrindRepeatInstantiation = callgrind && qstrcmp(callgrind, "repeat-instantiation") == 0;
+    const bool callgrindCompilationAndInstantiation = callgrind && qstrcmp(callgrind, "compilation-and-instantiation") == 0;
+
 
     QGuiApplication app(argc, argv);
     QQmlEngine engine;
@@ -82,9 +118,17 @@ int main(int argc, char *argv[])
         QScopedPointer<QObject> object(component.create());
     }
 
+    const QUrl currentPathUrl = QUrl::fromLocalFile(QDir::currentPath() + QLatin1Char('/'));
+
     for (int i = 0; i < typeCount; ++i) {
-        const QByteArray qml
-                = "import QtQuick 2.0\n"
+        const QString type = QString::fromUtf8(types[i]);
+        const bool isQmlFile = type.endsWith(QLatin1String(".qml"));
+        const QUrl url = currentPathUrl.resolved(isQmlFile
+                    ? type
+                    : QStringLiteral("document.qml"));
+
+        const QByteArray qml = isQmlFile ? QByteArray()
+                : "import QtQuick 2.0\n"
                 + importStatements
                 + "\n"
                 + types[i] + " {\n"
@@ -94,9 +138,21 @@ int main(int argc, char *argv[])
 
         QQmlComponent component(&engine);
 
+        if (callgrindCompilation || callgrindCompilationAndInstantiation) {
+            CALLGRIND_START_INSTRUMENTATION;
+        }
+
         timer.start();
-        component.setData(qml, QUrl::fromLocalFile(QDir::currentPath() + QLatin1String("/document.qml")));
+        if (isQmlFile) {
+            component.loadUrl(url);
+        } else {
+            component.setData(qml, url);
+        }
         qint64 parseTime = timer.nsecsElapsed();
+
+        if (callgrindCompilation) {
+            CALLGRIND_STOP_INSTRUMENTATION;
+        }
 
         if (component.status() == QQmlComponent::Error) {
             qDebug() << "";
@@ -106,10 +162,28 @@ int main(int argc, char *argv[])
             continue;
         }
 
+#if PROFILER_ENABLERS
+        if (profile)
+            ProfilerStart(profile);
+#endif
+
+        if (callgrindInstantiation || callgrindSingleInstantiation) {
+            CALLGRIND_START_INSTRUMENTATION;
+        }
 
         timer.start();
         QScopedPointer<QObject> object(component.create());
         qint64 oneTimeConstruction = timer.nsecsElapsed();
+
+        if (callgrindSingleInstantiation) {
+            CALLGRIND_STOP_INSTRUMENTATION;
+        }
+
+        object.reset();
+
+        if (callgrindRepeatInstantiation) {
+            CALLGRIND_START_INSTRUMENTATION;
+        }
 
         qint64 accumulatedConstruction = 0;
         qint64 accumulatedTotal = 0;
@@ -122,6 +196,15 @@ int main(int argc, char *argv[])
             accumulatedTotal += timer.nsecsElapsed();
         }
 
+        if (callgrindInstantiation || callgrindRepeatInstantiation) {
+            CALLGRIND_STOP_INSTRUMENTATION;
+        }
+
+#if PROFILER_ENABLERS
+        if (profile)
+            ProfilerStop();
+#endif
+
         const QLocale locale = QLocale::system();
 
         qDebug() << "";
@@ -130,8 +213,23 @@ int main(int argc, char *argv[])
         qDebug() << qml.constData();
         qDebug() << "One time parse time (ns)        " << qPrintable(locale.toString(parseTime));
         qDebug() << "One time construction time (ns):" << qPrintable(locale.toString(oneTimeConstruction));
-        qDebug() << "Average construction time (ns): " << qPrintable(locale.toString(accumulatedConstruction / iterations));
-        qDebug() << "Average destruction time (ns):  " << qPrintable(locale.toString((accumulatedTotal - accumulatedConstruction) / iterations));
+        if (iterations > 0) {
+            qDebug() << "Average construction time (ns): " << qPrintable(locale.toString(accumulatedConstruction / iterations));
+            qDebug() << "Average destruction time (ns):  " << qPrintable(locale.toString((accumulatedTotal - accumulatedConstruction) / iterations));
+        }
+
+        if (csvId) {
+            printf("%s,\"%s\",%s,%i,%lld,%lld,%lld,%lld\n",
+                        csvId,
+                        qPrintable(importDescription.replace('"', "\\\"")),
+                        types[i],
+                        iterations,
+                        parseTime,
+                        oneTimeConstruction,
+                        iterations > 0 ? accumulatedConstruction / iterations : 0,
+                        iterations > 0 ? (accumulatedTotal - accumulatedConstruction) / iterations : 0);
+
+        }
     }
     return 0;
 }
